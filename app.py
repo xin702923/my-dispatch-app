@@ -1,67 +1,53 @@
 import streamlit as st
+from pdf2image import convert_from_bytes
+import pytesseract
 import re
-import io
-from docx import Document
+from PIL import Image, ImageOps
 
-def refined_parse(raw_text):
-    # 1. 預處理：統一全角半角符號，並處理可能的亂碼空格
-    text = raw_text.replace('：', ':').replace('\xa0', ' ')
-    
-    # 2. 批次切割邏輯：以「文號:」作為每份公文的起點
-    # 使用「正向預查」確保「文號」兩個字不會消失
-    doc_blocks = re.split(r'(?=文號\s*[:])', text)
-    
-    results = []
-    for block in doc_blocks:
-        if "文號" not in block: continue
-        
-        info = {}
-        # 3. 強化的正則表達式 (支援空格與不同換行)
-        # 文號：抓取到下一個關鍵字或換行為止
-        info['doc_no'] = re.search(r"文號\s*:\s*(\S+)", block).group(1) if re.search(r"文號\s*:\s*(\S+)", block) else ""
-        
-        # 日期：抓取 yyyy/mm/dd 或 yyy/mm/dd 格式
-        info['doc_date'] = re.search(r"發文日期\s*:\s*([\d/]+)", block).group(1) if re.search(r"發文日期\s*:\s*([\d/]+)", block) else ""
-        info['recv_date'] = re.search(r"收文日期\s*:\s*([\d/]+)", block).group(1) if re.search(r"收文日期\s*:\s*([\d/]+)", block) else ""
-        
-        # 序號：精準抓取「收」開頭的編號
-        info['site_id'] = re.search(r"工地序號\s*:\s*(\S+)", block).group(1) if re.search(r"工地序號\s*:\s*(\S+)", block) else ""
-        info['recv_id'] = re.search(r"收文序號\s*:\s*(\S+)", block).group(1) if re.search(r"收文序號\s*:\s*(\S+)", block) else ""
-        
-        # 主旨：最難抓的部分，設定明確的終止詞（如：時限、文件分類、組別）
-        subj_match = re.search(r"主旨\s*[:]\s*([\s\S]+?)(?=時限|文件分類|組別|備註|$)", block)
-        if subj_match:
-            # 清理主旨內的換行與多餘空格，使其變成完整的一句話
-            clean_subj = re.sub(r'\s+', '', subj_match.group(1))
-            info['subject'] = clean_subj
-        else:
-            info['subject'] = ""
-            
-        results.append(info)
-    return results
+def ocr_with_crop(pdf_bytes):
+    # 1. 將 PDF 第一頁轉為高解析度圖片 (300 DPI 辨識手寫較準)
+    images = convert_from_bytes(pdf_bytes, dpi=300, first_page=1, last_page=1)
+    img = images[0]
+    width, height = img.size
 
-# --- Streamlit 介面優化 ---
-st.title("🚀 精準版批次公文助手")
-raw_input = st.text_area("請貼上公司網頁內容：", height=250)
+    # 2. 全域辨識 (抓文號、主旨、發文日期)
+    full_text = pytesseract.image_to_string(img, lang='chi_tra+eng')
 
-if raw_input:
-    data_list = refined_parse(raw_input)
-    st.write(f"📊 系統偵測到 {len(data_list)} 筆資料")
+    # 3. 局部裁切 (抓左下角的手寫收文日期)
+    # 座標範例：左側 0~30%, 下方 70~100% (視實際公文格式調整)
+    left = 0
+    top = int(height * 0.75) 
+    right = int(width * 0.4)
+    bottom = height
+    crop_img = img.crop((left, top, right, bottom))
     
-    # 讓使用者可以「編輯」偵測後的結果，確保 100% 正確
-    final_checked_data = []
-    for i, item in enumerate(data_list):
-        with st.expander(f"第 {i+1} 筆：{item['doc_no']}"):
-            col1, col2 = st.columns(2)
-            with col1:
-                u_no = st.text_input(f"文號-{i}", value=item['doc_no'])
-                u_s_id = st.text_input(f"工地序號-{i}", value=item['site_id'])
-            with col2:
-                u_date = st.text_input(f"發文日期-{i}", value=item['doc_date'])
-                u_r_id = st.text_input(f"收文序號-{i}", value=item['recv_id'])
-            u_subj = st.text_area(f"主旨-{i}", value=item['subject'])
-            
-            final_checked_data.append({
-                "doc_no": u_no, "doc_date": u_date, "site_id": u_s_id,
-                "recv_id": u_r_id, "subject": u_subj, "recv_date": item['recv_date']
-            })
+    # 強化圖片：轉灰階、提高對比，幫助辨識手寫
+    crop_img = ImageOps.grayscale(crop_img)
+    # 這裡可以視需求加入更多濾鏡
+    
+    # 單獨辨識左下角
+    handwritten_text = pytesseract.image_to_string(crop_img, lang='chi_tra+eng', config='--psm 6')
+
+    # 4. 解析資料
+    data = {}
+    data['doc_no'] = re.search(r"文\s*號[:：]\s*(\S+)", full_text).group(1) if re.search(r"文\s*號[:：]\s*(\S+)", full_text) else ""
+    data['subject'] = re.search(r"主旨[:：]\s*([\s\S]+?)(?=說明|正本|$)", full_text).group(1).strip() if re.search(r"主旨[:：]\s*([\s\S]+?)(?=說明|正本|$)", full_text) else ""
+    
+    # 嘗試從手寫區抓日期 (例如 115/03/09)
+    date_match = re.search(r"(\d{2,3}/\d{1,2}/\d{1,2})", handwritten_text)
+    data['recv_date'] = date_match.group(1) if date_match else ""
+    
+    return data, img, crop_img
+
+# --- UI 介面 ---
+if uploaded_pdf:
+    result, full_img, crop_img = ocr_with_crop(uploaded_pdf.read())
+    
+    st.image(full_img, caption="完整公文", use_container_width=True)
+    
+    with st.sidebar:
+        st.subheader("🔍 手寫區域放大")
+        st.image(crop_img, caption="左下角裁切範圍")
+        st.write("若辨識不準，請直接修改下方欄位")
+
+    # 填寫區... (同前一份程式碼)
